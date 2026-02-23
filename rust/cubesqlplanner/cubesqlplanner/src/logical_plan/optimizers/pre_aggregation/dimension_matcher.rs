@@ -35,6 +35,7 @@ pub struct DimensionMatcher<'a> {
     pre_aggregation: &'a CompiledPreAggregation,
     pre_aggregation_dimensions: HashMap<String, bool>,
     pre_aggregation_time_dimensions: HashMap<String, (Option<Rc<TimeDimensionSymbol>>, bool)>,
+    pre_aggregation_segments: HashMap<String, bool>,
     result: MatchState,
 }
 
@@ -56,11 +57,17 @@ impl<'a> DimensionMatcher<'a> {
                 }
             })
             .collect::<HashMap<_, _>>();
+        let pre_aggregation_segments = pre_aggregation
+            .segments
+            .iter()
+            .map(|s| (s.full_name(), false))
+            .collect();
         Self {
             query_tools,
             pre_aggregation,
             pre_aggregation_dimensions,
             pre_aggregation_time_dimensions,
+            pre_aggregation_segments,
             result: MatchState::Full,
         }
     }
@@ -128,6 +135,12 @@ impl<'a> DimensionMatcher<'a> {
                 MatchState::Partial
             };
         self.result = self.result.combine(&time_dimension_coverage_result);
+        let segment_coverage_result = if self.pre_aggregation_segments.values().all(|v| *v) {
+            MatchState::Full
+        } else {
+            MatchState::Partial
+        };
+        self.result = self.result.combine(&segment_coverage_result);
         self.result
     }
 
@@ -143,7 +156,30 @@ impl<'a> DimensionMatcher<'a> {
             MemberSymbol::TimeDimension(time_dimension) => {
                 self.try_match_time_dimension(time_dimension, add_to_matched_dimension)
             }
-            MemberSymbol::MemberExpression(_member_expression) => Ok(MatchState::NotMatched), //TODO We don't allow to use pre-aggregations with member expressions before SQL API is ready for it
+            MemberSymbol::MemberExpression(me) => {
+                if let Some(found) = self.pre_aggregation_segments.get_mut(&me.full_name()) {
+                    if add_to_matched_dimension {
+                        *found = true;
+                    }
+                    Ok(MatchState::Full)
+                } else {
+                    let dependencies = me.get_dependencies();
+                    if dependencies.is_empty() {
+                        Ok(MatchState::NotMatched)
+                    } else {
+                        let mut result = MatchState::Partial;
+                        for dep in dependencies {
+                            let dep_match =
+                                self.try_match_symbol(&dep, add_to_matched_dimension)?;
+                            if dep_match == MatchState::NotMatched {
+                                return Ok(MatchState::NotMatched);
+                            }
+                            result = result.combine(&dep_match);
+                        }
+                        Ok(result)
+                    }
+                }
+            }
             _ => Ok(MatchState::NotMatched),
         }
     }
@@ -653,6 +689,141 @@ mod tests {
                 "},
             ),
             MatchState::Full,
+        );
+    }
+
+    #[test]
+    fn test_segment_full_match() {
+        let ctx = create_test_context();
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "segment_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.status
+                    segments:
+                      - orders.high_priority
+                    time_dimensions:
+                      - dimension: orders.created_at
+                        granularity: day
+                "},
+            ),
+            MatchState::Full,
+        );
+    }
+
+    #[test]
+    fn test_segment_partial_match_unused_segment() {
+        let ctx = create_test_context();
+        // No segment in query, but pre-agg has segment => partial (unused segment coverage)
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "segment_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.status
+                    time_dimensions:
+                      - dimension: orders.created_at
+                        granularity: day
+                "},
+            ),
+            MatchState::Partial,
+        );
+    }
+
+    #[test]
+    fn test_segment_not_matched_missing_in_pre_agg() {
+        let ctx = create_test_context();
+        // Segment in query, but pre-agg without segments => NotMatched
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "main_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.status
+                      - orders.city
+                    segments:
+                      - orders.high_priority
+                "},
+            ),
+            MatchState::NotMatched,
+        );
+    }
+
+    #[test]
+    fn test_expression_segment_matched_via_dimensions() {
+        let ctx = create_test_context();
+        // status_filter depends on {CUBE.status}, status is in main_rollup dimensions
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "main_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.status
+                      - orders.city
+                    segments:
+                      - orders.status_filter
+                "},
+            ),
+            MatchState::Partial,
+        );
+    }
+
+    #[test]
+    fn test_expression_segment_not_matched_missing_dependency() {
+        let ctx = create_test_context();
+        // status_filter depends on {CUBE.status}, but daily_countries_rollup has no status dimension
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "daily_countries_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.country
+                    segments:
+                      - orders.status_filter
+                    time_dimensions:
+                      - dimension: orders.created_at
+                        granularity: day
+                "},
+            ),
+            MatchState::NotMatched,
+        );
+    }
+
+    #[test]
+    fn test_plain_segment_not_matched_via_dimensions() {
+        let ctx = create_test_context();
+        // high_priority has no {CUBE.x} deps, main_rollup has no segments => NotMatched
+        assert_eq!(
+            match_pre_agg(
+                &ctx,
+                "main_rollup",
+                indoc! {"
+                    measures:
+                      - orders.count
+                    dimensions:
+                      - orders.status
+                      - orders.city
+                    segments:
+                      - orders.high_priority
+                "},
+            ),
+            MatchState::NotMatched,
         );
     }
 }
